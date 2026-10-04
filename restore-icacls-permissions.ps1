@@ -19,7 +19,10 @@
     Corresponds to the directory parameter required by 'icacls <Directory> /restore <AclFile>'.
 
 .PARAMETER ContinueOnError
-    If set (default), appends the /c switch to icacls to continue processing even if errors occur on individual files.
+    If set (default: $true), appends the /c switch to icacls to continue processing even if errors occur on individual files.
+
+.PARAMETER Quiet
+    If set (default: $true), appends the /q switch to icacls to suppress success messages, logging only failures and the final summary.
 
 .EXAMPLE
     .\restore-icacls-permissions.ps1 "*.sddl"
@@ -41,7 +44,10 @@ param (
     [string]$TargetDirectory = '.',
 
     [Parameter(Mandatory = $false, HelpMessage = "Continue restore on errors (/c flag)")]
-    [bool]$ContinueOnError = $true
+    [bool]$ContinueOnError = $true,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Suppress individual success messages (/q flag), logging only failures and summary")]
+    [bool]$Quiet = $true
 )
 
 Set-StrictMode -Version Latest
@@ -110,45 +116,47 @@ foreach ($file in $files) {
     Write-LogMessage $fileHeader -ForegroundColor Cyan
     Write-LogMessage "Started at: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
 
-    # Build icacls command arguments: icacls <TargetDirectory> /restore <AclFile> [/c]
-    $cmdArgs = @($TargetDirectory, "/restore", "`"$($file.FullName)`"")
+    # Build icacls command arguments
+    $cmdArgs = [System.Collections.Generic.List[string]]::new()
+    $cmdArgs.Add($TargetDirectory)
+    $cmdArgs.Add("/restore")
+    $cmdArgs.Add($file.FullName)
     if ($ContinueOnError) {
-        $cmdArgs += "/c"
+        $cmdArgs.Add("/c")
+    }
+    if ($Quiet) {
+        $cmdArgs.Add("/q")
     }
 
-    $cmdString = "icacls $($cmdArgs -join ' ')"
+    $displayArgs = @($TargetDirectory, "/restore", "`"$($file.FullName)`"")
+    if ($ContinueOnError) { $displayArgs += "/c" }
+    if ($Quiet) { $displayArgs += "/q" }
+    $cmdString = "icacls $($displayArgs -join ' ')"
     Write-LogMessage "Executing: $cmdString" -ForegroundColor DarkGray
 
     $exitCode = 0
     $outputLines = @()
 
     try {
-        # Check if icacls is available
+        # Sync .NET environment directory with PowerShell provider path
+        try {
+            [System.Environment]::CurrentDirectory = (Get-Location).Path
+        } catch { }
+
         $icaclsCmd = Get-Command -Name "icacls.exe" -ErrorAction SilentlyContinue
         if ($icaclsCmd) {
-            # Execute icacls capturing stdout and stderr
-            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processInfo.FileName = $icaclsCmd.Source
-            $processInfo.Arguments = ($cmdArgs -join ' ')
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.UseShellExecute = $false
-            $processInfo.CreateNoWindow = $true
+            # Execute icacls natively, inheriting PowerShell current location ($PWD)
+            # 2>&1 streams stdout and stderr without pipe buffer deadlocks
+            $nativeOutput = & $icaclsCmd.Source $cmdArgs 2>&1
+            $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
 
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $processInfo
-            $process.Start() | Out-Null
-
-            $stdout = $process.StandardOutput.ReadToEnd()
-            $stderr = $process.StandardError.ReadToEnd()
-            $process.WaitForExit()
-            $exitCode = $process.ExitCode
-
-            if (-not [string]::IsNullOrWhiteSpace($stdout)) {
-                $outputLines += $stdout.TrimEnd()
-            }
-            if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-                $outputLines += "[STDERR] " + $stderr.TrimEnd()
+            if ($nativeOutput) {
+                foreach ($item in $nativeOutput) {
+                    $str = [string]$item
+                    if (-not [string]::IsNullOrWhiteSpace($str)) {
+                        $outputLines += $str.TrimEnd()
+                    }
+                }
             }
         } else {
             # Fallback for mock/test environments
@@ -161,19 +169,28 @@ foreach ($file in $files) {
     }
 
     # Log command output
+    $failedItemCount = 0
     foreach ($line in $outputLines) {
-        if ($line -match 'failed' -or $line -match 'error' -or $line -match '\[ERROR\]') {
+        if ($line -match 'Failed processing\s+([1-9]\d*)\s+files') {
+            $failedItemCount = [int]$Matches[1]
+            Write-LogMessage "  $line" -ForegroundColor Red
+        } elseif ($line -match 'failed' -or $line -match 'error' -or $line -match '\[ERROR\]' -or $line -match 'cannot find') {
             Write-LogMessage "  $line" -ForegroundColor Yellow
         } else {
             Write-LogMessage "  $line" -ForegroundColor Gray
         }
     }
 
-    if ($exitCode -eq 0) {
-        Write-LogMessage "[SUCCESS] Completed restore for: $($file.Name) (Exit Code: $exitCode)" -ForegroundColor Green
+    if ($exitCode -eq 0 -and $failedItemCount -eq 0) {
+        Write-LogMessage "[SUCCESS] Completed restore for: $($file.Name)" -ForegroundColor Green
         $successCount++
     } else {
-        Write-LogMessage "[FAILURE] Failed restore for: $($file.Name) (Exit Code: $exitCode)" -ForegroundColor Red
+        $statusMsg = if ($failedItemCount -gt 0) {
+            "[FAILURE] Restored with $failedItemCount failed file(s) for: $($file.Name) (Exit Code: $exitCode)"
+        } else {
+            "[FAILURE] Failed restore for: $($file.Name) (Exit Code: $exitCode)"
+        }
+        Write-LogMessage $statusMsg -ForegroundColor Red
         $failCount++
     }
 }
